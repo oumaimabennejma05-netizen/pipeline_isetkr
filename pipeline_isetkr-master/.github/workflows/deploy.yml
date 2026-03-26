@@ -1,0 +1,440 @@
+name: GMAO — Deploy Pipeline
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      clean_start:
+        description: "🧹 Nettoyer TOUT avant de déployer (destroy VM + SG + rebuild)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      skip_post_install:
+        description: "Passer le post-install (si déjà fait)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      destroy_only:
+        description: "🔴 Détruire l'infrastructure SANS reconstruire"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+env:
+  TF_DIR: ./terraform
+  AWS_REGION: us-east-1
+
+concurrency:
+  group: gmao-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 0 — 🧹 Nettoyage complet (efface TOUTE trace de VM précédente)
+#  → Activé par : clean_start=true OU destroy_only=true
+#  → Terraform destroy + suppression SG orphelins + suppression instances
+# ════════════════════════════════════════════════════════════════════════════
+  job0_clean:
+    name: "JOB 0 — 🧹 Nettoyage complet"
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.inputs.clean_start == 'true' ||
+      github.event.inputs.destroy_only == 'true'
+
+    steps:
+      - name: 📥 Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configuration credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: 🏗️ Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: 🔧 Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+
+      # ── Étape 1 : Terraform Destroy (si state non vide) ─────────────────
+      - name: 🧹 Terraform Destroy
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "🔍 Vérification du state Terraform..."
+          RESOURCES=$(terraform state list 2>/dev/null | wc -l || echo "0")
+
+          if [ "$RESOURCES" -gt 0 ]; then
+            echo "🧹 $RESOURCES ressource(s) dans le state → destruction..."
+            terraform state list
+            terraform destroy -auto-approve
+            echo "✅ Terraform destroy terminé"
+          else
+            echo "✅ State vide — rien à détruire via Terraform"
+          fi
+
+      # ── Étape 2 : Suppression des instances EC2 gmao-server ─────────────
+      - name: 🧹 Suppression instances EC2 'gmao-server' orphelines
+        run: |
+          echo "🔍 Recherche d'instances EC2 'gmao-server' (running/stopped)..."
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=gmao-server" \
+              "Name=instance-state-name,Values=running,stopped,pending" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$INSTANCE_IDS" ] && [ "$INSTANCE_IDS" != "None" ]; then
+            echo "🗑️ Instances trouvées : $INSTANCE_IDS"
+            for ID in $INSTANCE_IDS; do
+              echo "  Terminaison de $ID..."
+              aws ec2 terminate-instances --instance-ids "$ID"
+            done
+            echo "⏳ Attente de la terminaison..."
+            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS 2>/dev/null || true
+            echo "✅ Toutes les instances gmao-server terminées"
+          else
+            echo "✅ Aucune instance EC2 gmao-server trouvée"
+          fi
+
+      # ── Étape 3 : Suppression des Security Groups gmao-sg-* ─────────────
+      - name: 🧹 Suppression Security Groups 'gmao-sg-*' orphelins
+        run: |
+          echo "🔍 Recherche de Security Groups gmao-sg-*..."
+          # Attendre un peu que les ENI se détachent après terminaison des instances
+          sleep 10
+
+          SG_IDS=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=gmao-sg-*" \
+            --query 'SecurityGroups[*].GroupId' \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$SG_IDS" ] && [ "$SG_IDS" != "None" ]; then
+            for SG_ID in $SG_IDS; do
+              echo "  Suppression du SG : $SG_ID"
+              aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null || \
+                echo "  ⚠️ $SG_ID encore attaché — retry dans 15s..."
+              sleep 2
+            done
+
+            # Retry pour les SG récalcitrants (ENI pas encore détachées)
+            sleep 15
+            for SG_ID in $SG_IDS; do
+              aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null || true
+            done
+            echo "✅ Security Groups nettoyés"
+          else
+            echo "✅ Aucun Security Group gmao-sg-* trouvé"
+          fi
+
+      # ── Étape 4 : Nettoyage du state Terraform résiduel ─────────────────
+      - name: 🧹 Purge du state Terraform
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "🔍 Vérification state résiduel..."
+          REMAINING=$(terraform state list 2>/dev/null | wc -l || echo "0")
+          if [ "$REMAINING" -gt 0 ]; then
+            echo "🧹 Purge de $REMAINING ressource(s) orpheline(s) du state..."
+            terraform state list 2>/dev/null | while read -r resource; do
+              terraform state rm "$resource" 2>/dev/null || true
+            done
+            echo "✅ State purgé"
+          else
+            echo "✅ State déjà propre"
+          fi
+
+      - name: 📋 Résumé du nettoyage
+        if: always()
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "║  🧹 NETTOYAGE COMPLET TERMINÉ                        ║"
+          echo "╠══════════════════════════════════════════════════════╣"
+          echo "║  ✗ Instances EC2 gmao-server → terminées             ║"
+          echo "║  ✗ Security Groups gmao-sg-* → supprimés             ║"
+          echo "║  ✗ Terraform state           → purgé                 ║"
+          echo "╠══════════════════════════════════════════════════════╣"
+          if [ "${{ github.event.inputs.destroy_only }}" = "true" ]; then
+            echo "║  Mode : destroy_only → pipeline terminé              ║"
+          else
+            echo "║  Mode : clean_start → rebuild en cours (Jobs 1-3)    ║"
+          fi
+          echo "╚══════════════════════════════════════════════════════╝"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 1 — Création VM EC2
+#  → Attend Job 0 (si activé), puis crée ou réutilise la VM
+# ════════════════════════════════════════════════════════════════════════════
+  job1_create_vm:
+    name: "JOB 1 — Création VM EC2"
+    runs-on: ubuntu-latest
+    needs: job0_clean
+    if: >-
+      always() &&
+      (needs.job0_clean.result == 'success' || needs.job0_clean.result == 'skipped') &&
+      github.event.inputs.destroy_only != 'true'
+
+    outputs:
+      public_ip:   ${{ steps.resolve_ip.outputs.public_ip }}
+      instance_id: ${{ steps.resolve_ip.outputs.instance_id }}
+
+    steps:
+      - name: 📥 Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configuration credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: 🏗️ Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: 🔧 Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+
+      - name: 🔍 Vérification VM existante
+        id: check_vm
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          EXISTING_IP=$(terraform output -raw public_ip 2>/dev/null || echo "")
+          EXISTING_ID=$(terraform output -raw instance_id 2>/dev/null || echo "")
+
+          if [ -n "$EXISTING_IP" ]; then
+            INSTANCE_STATE=$(aws ec2 describe-instances \
+              --instance-ids "$EXISTING_ID" \
+              --query 'Reservations[0].Instances[0].State.Name' \
+              --output text 2>/dev/null || echo "not-found")
+
+            if [ "$INSTANCE_STATE" = "running" ]; then
+              echo "✅ VM $EXISTING_ID est running ($EXISTING_IP)"
+              echo "vm_exists=true" >> $GITHUB_OUTPUT
+              echo "existing_ip=$EXISTING_IP" >> $GITHUB_OUTPUT
+              echo "existing_id=$EXISTING_ID" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️ VM état=$INSTANCE_STATE → re-création"
+              echo "vm_exists=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "📦 Aucune VM dans le state → création"
+            echo "vm_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: ✅ Terraform Validate
+        if: steps.check_vm.outputs.vm_exists != 'true'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate
+
+      - name: 📋 Terraform Plan
+        if: steps.check_vm.outputs.vm_exists != 'true'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform plan -out=tfplan
+
+      - name: 🚀 Terraform Apply
+        if: steps.check_vm.outputs.vm_exists != 'true'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: 📤 Résolution IP finale
+        id: resolve_ip
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          if [ "${{ steps.check_vm.outputs.vm_exists }}" = "true" ]; then
+            echo "public_ip=${{ steps.check_vm.outputs.existing_ip }}" >> $GITHUB_OUTPUT
+            echo "instance_id=${{ steps.check_vm.outputs.existing_id }}" >> $GITHUB_OUTPUT
+          else
+            echo "public_ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
+            echo "instance_id=$(terraform output -raw instance_id)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: ⏳ Attente SSH (2 min max)
+        run: |
+          VM_IP="${{ steps.resolve_ip.outputs.public_ip }}"
+          for i in $(seq 1 24); do
+            nc -zv "$VM_IP" 22 2>/dev/null && echo "✅ SSH OK" && exit 0
+            echo "  $i/24 — 5s..."
+            sleep 5
+          done
+          echo "❌ SSH timeout" && exit 1
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 2 — Post-installation
+# ════════════════════════════════════════════════════════════════════════════
+  job2_post_install:
+    name: "JOB 2 — Post-Installation"
+    runs-on: ubuntu-latest
+    needs: job1_create_vm
+    if: >-
+      always() &&
+      needs.job1_create_vm.result == 'success' &&
+      github.event.inputs.destroy_only != 'true'
+
+    env:
+      VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
+
+    steps:
+      - name: 📥 Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configuration clé SSH (vockey)
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
+          chmod 600 ~/.ssh/vockey.pem
+          ssh-keygen -l -f ~/.ssh/vockey.pem || { echo "❌ Clé SSH invalide"; exit 1; }
+          cat >> ~/.ssh/config <<EOF
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile ~/.ssh/vockey.pem
+          EOF
+
+      - name: 🔍 Vérification installations existantes
+        id: check_install
+        run: |
+          SKIP="${{ github.event.inputs.skip_post_install || 'false' }}"
+          if [ "$SKIP" = "true" ]; then
+            echo "already_installed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          RESULT=$(ssh -i ~/.ssh/vockey.pem -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            ubuntu@${{ env.VM_IP }} \
+            "command -v java && command -v mvn && command -v psql && command -v node && \
+             test -d ~/gmao-backend && test -d ~/gmao-frontend && echo 'ALL_OK'" \
+            2>/dev/null || echo "")
+
+          if echo "$RESULT" | grep -q "ALL_OK"; then
+            echo "already_installed=true" >> $GITHUB_OUTPUT
+          else
+            echo "already_installed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📤 Copie du script post-install
+        if: steps.check_install.outputs.already_installed != 'true'
+        run: |
+          scp -i ~/.ssh/vockey.pem -o StrictHostKeyChecking=no \
+            scripts/02_post_install.sh ubuntu@${{ env.VM_IP }}:~/02_post_install.sh
+
+      - name: ⚙️ Exécution du post-install
+        if: steps.check_install.outputs.already_installed != 'true'
+        timeout-minutes: 15
+        run: |
+          ssh -i ~/.ssh/vockey.pem -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.VM_IP }} \
+            "chmod +x ~/02_post_install.sh && ~/02_post_install.sh"
+
+      - name: ✅ Vérification des installations
+        run: |
+          ssh -i ~/.ssh/vockey.pem -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.VM_IP }} \
+            "echo '=== Outils ===' && \
+             java -version 2>&1 | head -1 && \
+             mvn -version 2>&1 | head -1 && \
+             psql --version && node -v && npm -v && \
+             echo '=== Projets ===' && \
+             ls ~/gmao-backend/ && ls ~/gmao-frontend/"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 3 — Démarrage Application GMAO
+# ════════════════════════════════════════════════════════════════════════════
+  job3_start_app:
+    name: "JOB 3 — Démarrage Application GMAO"
+    runs-on: ubuntu-latest
+    needs: [job1_create_vm, job2_post_install]
+    if: >-
+      always() &&
+      needs.job2_post_install.result == 'success' &&
+      github.event.inputs.destroy_only != 'true'
+
+    env:
+      VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
+
+    steps:
+      - name: 📥 Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configuration clé SSH (vockey)
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
+          chmod 600 ~/.ssh/vockey.pem
+          ssh-keygen -l -f ~/.ssh/vockey.pem || { echo "❌ Clé SSH invalide"; exit 1; }
+          cat >> ~/.ssh/config <<EOF
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile ~/.ssh/vockey.pem
+          EOF
+
+      - name: 📤 Copie du dossier BD/
+        run: |
+          ssh -i ~/.ssh/vockey.pem -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.VM_IP }} "mkdir -p ~/BD"
+          scp -i ~/.ssh/vockey.pem -o StrictHostKeyChecking=no \
+            -r BD/* ubuntu@${{ env.VM_IP }}:~/BD/
+
+      - name: 📤 Copie du script de démarrage
+        run: |
+          scp -i ~/.ssh/vockey.pem -o StrictHostKeyChecking=no \
+            scripts/03_start_app.sh ubuntu@${{ env.VM_IP }}:~/03_start_app.sh
+
+      - name: 🚀 Lancement (restore DB + Spring Boot + Angular)
+        timeout-minutes: 10
+        run: |
+          ssh -i ~/.ssh/vockey.pem -o StrictHostKeyChecking=no \
+            ubuntu@${{ env.VM_IP }} \
+            "chmod +x ~/03_start_app.sh && ~/03_start_app.sh"
+
+      - name: 🔍 Test Backend (port 8080)
+        run: |
+          for i in $(seq 1 12); do
+            CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://${{ env.VM_IP }}:8080 || echo "000")
+            [ "$CODE" != "000" ] && echo "✅ Backend OK (HTTP $CODE)" && exit 0
+            echo "  $i/12 — 5s..." && sleep 5
+          done
+          echo "❌ Backend timeout" && exit 1
+
+      - name: 🔍 Test Frontend Angular (port 4200)
+        run: |
+          for i in $(seq 1 12); do
+            CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://${{ env.VM_IP }}:4200 || echo "000")
+            [ "$CODE" != "000" ] && echo "✅ Frontend OK (HTTP $CODE)" && exit 0
+            echo "  $i/12 — 5s..." && sleep 5
+          done
+          echo "❌ Frontend timeout" && exit 1
+
+      - name: 📋 Résumé du déploiement
+        if: always()
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "║         DÉPLOIEMENT GMAO TERMINÉ ✅                  ║"
+          echo "╠══════════════════════════════════════════════════════╣"
+          echo "║  Backend  (Spring Boot) → http://${{ env.VM_IP }}:8080  ║"
+          echo "║  Frontend (Angular)     → http://${{ env.VM_IP }}:4200  ║"
+          echo "╚══════════════════════════════════════════════════════╝"

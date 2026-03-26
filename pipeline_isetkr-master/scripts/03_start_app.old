@@ -1,0 +1,177 @@
+#!/bin/bash
+# =============================================================================
+# JOB 3 — Lancement de l'application GMAO
+# 1. Démarrage réel du cluster PostgreSQL (pg_ctlcluster)
+# 2. Restore base via ~/BD/restore.sh
+# 3. Démarrage Spring Boot backend  (port 8080)
+# 4. Démarrage Angular frontend     (port 4200)
+# =============================================================================
+set -euo pipefail
+LOG="/tmp/start_app.log"
+exec > >(tee -a "$LOG") 2>&1
+
+echo "============================================"
+echo "  JOB 3 — DÉMARRAGE GMAO  $(date)"
+echo "============================================"
+
+BACKUP_FILE="gmao_backup_20260324_1458.sql"
+BD_DIR="$HOME/BD"
+BACKEND_DIR="$HOME/gmao-backend"
+FRONTEND_DIR="$HOME/gmao-frontend"
+
+# ── [0/5] Vérifications préalables ────────────────────────────────────────────
+echo ""
+echo "[0/5] Vérifications préalables..."
+[ -d "$BACKEND_DIR" ]  || { echo "❌ $BACKEND_DIR introuvable."; exit 1; }
+[ -d "$FRONTEND_DIR" ] || { echo "❌ $FRONTEND_DIR introuvable."; exit 1; }
+[ -d "$BD_DIR" ]       || { echo "❌ $BD_DIR introuvable."; exit 1; }
+[ -f "$BD_DIR/restore.sh" ]    || { echo "❌ restore.sh introuvable dans $BD_DIR"; exit 1; }
+[ -f "$BD_DIR/$BACKUP_FILE" ]  || { echo "❌ $BACKUP_FILE introuvable dans $BD_DIR"; exit 1; }
+echo "✅ Tous les fichiers sont présents"
+
+# ── [1/5] Démarrage réel de PostgreSQL ────────────────────────────────────────
+echo ""
+echo "[1/5] Démarrage de PostgreSQL..."
+
+# Identifier le cluster installé (ex: 12/main sur Ubuntu 20.04)
+PG_VERSION=$(ls /etc/postgresql/ | sort -V | tail -1)
+PG_CLUSTER="main"
+echo "Cluster détecté : ${PG_VERSION}/${PG_CLUSTER}"
+
+# Arrêt propre puis démarrage via pg_ctlcluster
+# (systemctl seul laisse le cluster en état "exited" sur Ubuntu 20.04)
+sudo pg_ctlcluster ${PG_VERSION} ${PG_CLUSTER} stop  2>/dev/null || true
+sleep 2
+sudo pg_ctlcluster ${PG_VERSION} ${PG_CLUSTER} start
+
+# Attente que PostgreSQL écoute réellement sur le port 5432 (30s max)
+echo "Attente que PostgreSQL écoute sur le port 5432..."
+for i in $(seq 1 30); do
+  if pg_isready -h localhost -p 5432 -q 2>/dev/null; then
+    echo "✅ PostgreSQL est prêt (port 5432)"
+    break
+  fi
+  if [ "$i" -eq 30 ]; then
+    echo "❌ PostgreSQL non disponible après 30s"
+    sudo pg_lsclusters
+    cat /var/log/postgresql/postgresql-${PG_VERSION}-${PG_CLUSTER}.log 2>/dev/null | tail -30
+    exit 1
+  fi
+  echo -n "."
+  sleep 1
+done
+echo ""
+
+# Vérification finale : tester une vraie requête SQL
+sudo -u postgres psql -c "SELECT version();" || {
+  echo "❌ Impossible de se connecter à PostgreSQL"
+  exit 1
+}
+
+# Création du rôle ubuntu si besoin
+sudo -u postgres psql -c "\du" | grep -q "ubuntu" || \
+  sudo -u postgres psql -c "CREATE ROLE ubuntu WITH SUPERUSER LOGIN PASSWORD 'ubuntu';" 2>/dev/null || true
+
+# ── [2/5] Restore de la base de données ──────────────────────────────────────
+echo ""
+echo "[2/5] Restauration de la base PostgreSQL ($BACKUP_FILE)..."
+cd "$BD_DIR"
+chmod +x ./restore.sh
+
+# Le restore.sh attend :
+#   - BACKUP_DIR pour trouver les .sql
+#   - PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE
+#   - --yes pour skip la confirmation interactive
+# On exécute en tant que postgres avec les bonnes variables
+sudo -u postgres bash -c "
+  export BACKUP_DIR='$BD_DIR'
+  export PGHOST='localhost'
+  export PGPORT='5432'
+  export PGUSER='postgres'
+  export PGPASSWORD='postgres'
+  export PGDATABASE='gmao_db'
+  cd '$BD_DIR' && ./restore.sh '$BACKUP_FILE' --yes
+"
+echo "✅ Base de données restaurée"
+
+# ── [3/5] Démarrage Spring Boot (backend) ─────────────────────────────────────
+echo ""
+echo "[3/5] Démarrage du backend Spring Boot (port 8080)..."
+cd "$BACKEND_DIR"
+
+# Arrêt de tout process existant sur le port 8080
+fuser -k 8080/tcp 2>/dev/null || true
+sleep 2
+
+nohup mvn spring-boot:run > /tmp/gmao-backend.log 2>&1 &
+BACKEND_PID=$!
+echo "$BACKEND_PID" > /tmp/gmao-backend.pid
+echo "Backend lancé (PID $BACKEND_PID) — attente démarrage (90s max)..."
+
+for i in $(seq 1 90); do
+  if curl -s http://localhost:8080/actuator/health > /dev/null 2>&1 || \
+     curl -s http://localhost:8080 > /dev/null 2>&1; then
+    echo ""
+    echo "✅ Backend disponible sur le port 8080"
+    break
+  fi
+  echo -n "."
+  sleep 1
+done
+echo ""
+
+# ── [4/5] Démarrage Angular (frontend) ────────────────────────────────────────
+echo ""
+echo "[4/5] Démarrage du frontend Angular (port 4200)..."
+cd "$FRONTEND_DIR"
+
+# Arrêt de tout process existant sur le port 4200
+fuser -k 4200/tcp 2>/dev/null || true
+sleep 2
+
+# Installation des dépendances si absentes
+if [ ! -d "node_modules" ]; then
+  echo "Installation des dépendances npm..."
+  npm install
+fi
+
+# Installation de @angular/cli localement si absent
+if [ ! -f "node_modules/.bin/ng" ]; then
+  echo "Installation de @angular/cli..."
+  npm install @angular/cli
+fi
+
+# Démarrage Angular (écoute sur 0.0.0.0 pour accès externe)
+nohup npx ng serve --host 0.0.0.0 --port 4200 --disable-host-check > /tmp/gmao-frontend.log 2>&1 &
+FRONTEND_PID=$!
+echo "$FRONTEND_PID" > /tmp/gmao-frontend.pid
+echo "Frontend lancé (PID $FRONTEND_PID) — attente démarrage (90s max)..."
+
+for i in $(seq 1 90); do
+  if curl -s http://localhost:4200 > /dev/null 2>&1; then
+    echo ""
+    echo "✅ Frontend Angular disponible sur le port 4200"
+    break
+  fi
+  echo -n "."
+  sleep 1
+done
+echo ""
+
+# ── [5/5] Résumé ──────────────────────────────────────────────────────────────
+PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "VOTRE_IP")
+
+echo ""
+echo "╔══════════════════════════════════════════════════╗"
+echo "║        APPLICATION GMAO DÉMARRÉE ✅              ║"
+echo "╠══════════════════════════════════════════════════╣"
+echo "║  Backend  →  http://$PUBLIC_IP:8080         ║"
+echo "║  Frontend →  http://$PUBLIC_IP:4200         ║"
+echo "╠══════════════════════════════════════════════════╣"
+echo "║  Logs backend  : tail -f /tmp/gmao-backend.log  ║"
+echo "║  Logs frontend : tail -f /tmp/gmao-frontend.log ║"
+echo "╠══════════════════════════════════════════════════╣"
+echo "║  Arrêter :                                       ║"
+echo "║    kill \$(cat /tmp/gmao-backend.pid)            ║"
+echo "║    kill \$(cat /tmp/gmao-frontend.pid)           ║"
+echo "╚══════════════════════════════════════════════════╝"

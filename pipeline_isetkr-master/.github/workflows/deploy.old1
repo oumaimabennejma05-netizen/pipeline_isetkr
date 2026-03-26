@@ -1,0 +1,350 @@
+name: GMAO — Deploy Pipeline
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      force_recreate_vm:
+        description: "Forcer la re-création de la VM (destroy + apply)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      skip_post_install:
+        description: "Passer le post-install (si déjà fait)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+env:
+  TF_DIR: ./terraform
+  AWS_REGION: us-east-1
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Concurrency : évite les exécutions parallèles sur la même branche
+# ════════════════════════════════════════════════════════════════════════════
+concurrency:
+  group: gmao-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 1 — Création / Vérification VM EC2
+#  → Si la VM existe et répond en SSH, on skip la création
+# ════════════════════════════════════════════════════════════════════════════
+  job1_create_vm:
+    name: "JOB 1 — Création / Vérification VM EC2"
+    runs-on: ubuntu-latest
+
+    outputs:
+      public_ip:   ${{ steps.resolve_ip.outputs.public_ip }}
+      instance_id: ${{ steps.resolve_ip.outputs.instance_id }}
+      vm_created:  ${{ steps.resolve_ip.outputs.vm_created }}
+
+    steps:
+      - name: 📥 Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configuration credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: 🏗️ Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: 🔧 Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+
+      # ── Vérifier si la VM existe déjà via Terraform state ────────────────
+      - name: 🔍 Vérification VM existante
+        id: check_vm
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          # Tenter de lire l'IP depuis le state Terraform existant
+          EXISTING_IP=$(terraform output -raw public_ip 2>/dev/null || echo "")
+          EXISTING_ID=$(terraform output -raw instance_id 2>/dev/null || echo "")
+          FORCE="${{ github.event.inputs.force_recreate_vm || 'false' }}"
+
+          if [ -n "$EXISTING_IP" ] && [ "$FORCE" != "true" ]; then
+            echo "🔎 VM détectée dans le state : $EXISTING_ID ($EXISTING_IP)"
+
+            # Vérifier que la VM est réellement accessible (running + SSH)
+            INSTANCE_STATE=$(aws ec2 describe-instances \
+              --instance-ids "$EXISTING_ID" \
+              --query 'Reservations[0].Instances[0].State.Name' \
+              --output text 2>/dev/null || echo "not-found")
+
+            if [ "$INSTANCE_STATE" = "running" ]; then
+              echo "✅ VM $EXISTING_ID est en état 'running'"
+              echo "vm_exists=true" >> $GITHUB_OUTPUT
+              echo "existing_ip=$EXISTING_IP" >> $GITHUB_OUTPUT
+              echo "existing_id=$EXISTING_ID" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️ VM existe dans le state mais état=$INSTANCE_STATE → re-création"
+              echo "vm_exists=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            [ "$FORCE" = "true" ] && echo "🔄 Force re-création demandée"
+            echo "vm_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Création si nécessaire ───────────────────────────────────────────
+      - name: ✅ Terraform Validate
+        if: steps.check_vm.outputs.vm_exists != 'true'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate
+
+      - name: 📋 Terraform Plan
+        if: steps.check_vm.outputs.vm_exists != 'true'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform plan -out=tfplan
+
+      - name: 🚀 Terraform Apply
+        if: steps.check_vm.outputs.vm_exists != 'true'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      # ── Résolution finale de l'IP (créée ou existante) ───────────────────
+      - name: 📤 Résolution IP finale
+        id: resolve_ip
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          if [ "${{ steps.check_vm.outputs.vm_exists }}" = "true" ]; then
+            PUBLIC_IP="${{ steps.check_vm.outputs.existing_ip }}"
+            INSTANCE_ID="${{ steps.check_vm.outputs.existing_id }}"
+            echo "vm_created=false" >> $GITHUB_OUTPUT
+            echo "♻️ VM existante réutilisée"
+          else
+            PUBLIC_IP=$(terraform output -raw public_ip)
+            INSTANCE_ID=$(terraform output -raw instance_id)
+            echo "vm_created=true" >> $GITHUB_OUTPUT
+            echo "🆕 Nouvelle VM créée"
+          fi
+          echo "public_ip=$PUBLIC_IP"     >> $GITHUB_OUTPUT
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "→ ID: $INSTANCE_ID | IP: $PUBLIC_IP"
+
+      # ── Attente SSH ──────────────────────────────────────────────────────
+      - name: ⏳ Attente SSH disponible (2 min max)
+        run: |
+          VM_IP="${{ steps.resolve_ip.outputs.public_ip }}"
+          echo "Attente du port 22 sur $VM_IP..."
+          for i in $(seq 1 24); do
+            if nc -zv "$VM_IP" 22 2>/dev/null; then
+              echo "✅ SSH disponible !"
+              exit 0
+            fi
+            echo "  Tentative $i/24 — 5s..."
+            sleep 5
+          done
+          echo "❌ SSH non disponible après 2 minutes"
+          exit 1
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 2 — Post-installation (packages + projets)
+#  → Vérifie si les outils sont déjà installés avant de relancer
+# ════════════════════════════════════════════════════════════════════════════
+  job2_post_install:
+    name: "JOB 2 — Post-Installation"
+    runs-on: ubuntu-latest
+    needs: job1_create_vm
+
+    env:
+      VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
+
+    steps:
+      - name: 📥 Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configuration clé SSH (vockey)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
+          chmod 600 ~/.ssh/vockey.pem
+          cat >> ~/.ssh/config <<EOF
+          Host ${{ env.VM_IP }}
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile ~/.ssh/vockey.pem
+          EOF
+
+      # ── Vérifier si le post-install a déjà été fait ──────────────────────
+      - name: 🔍 Vérification installations existantes
+        id: check_install
+        run: |
+          SKIP_INPUT="${{ github.event.inputs.skip_post_install || 'false' }}"
+          if [ "$SKIP_INPUT" = "true" ]; then
+            echo "⏭️ Skip post-install demandé manuellement"
+            echo "already_installed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Vérifier si les outils clés sont déjà installés
+          INSTALLED=$(ssh -i ~/.ssh/vockey.pem \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              ubuntu@${{ env.VM_IP }} \
+              "command -v java && command -v mvn && command -v psql && command -v node && \
+               test -d ~/gmao-backend && test -d ~/gmao-frontend && echo 'ALL_OK'" \
+              2>/dev/null || echo "")
+
+          if echo "$INSTALLED" | grep -q "ALL_OK"; then
+            echo "✅ Tous les outils et projets sont déjà installés"
+            echo "already_installed=true" >> $GITHUB_OUTPUT
+          else
+            echo "📦 Installation nécessaire"
+            echo "already_installed=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Installation si nécessaire ───────────────────────────────────────
+      - name: 📤 Copie du script post-install sur la VM
+        if: steps.check_install.outputs.already_installed != 'true'
+        run: |
+          scp -i ~/.ssh/vockey.pem \
+              -o StrictHostKeyChecking=no \
+              scripts/02_post_install.sh \
+              ubuntu@${{ env.VM_IP }}:~/02_post_install.sh
+
+      - name: ⚙️ Exécution du post-install (Java, Maven, PostgreSQL, Node, npm, projets)
+        if: steps.check_install.outputs.already_installed != 'true'
+        timeout-minutes: 15
+        run: |
+          ssh -i ~/.ssh/vockey.pem \
+              -o StrictHostKeyChecking=no \
+              ubuntu@${{ env.VM_IP }} \
+              "chmod +x ~/02_post_install.sh && ~/02_post_install.sh"
+
+      # ── Vérification (toujours exécutée) ─────────────────────────────────
+      - name: ✅ Vérification des installations
+        run: |
+          ssh -i ~/.ssh/vockey.pem \
+              -o StrictHostKeyChecking=no \
+              ubuntu@${{ env.VM_IP }} \
+              "echo '=== Outils ===' && \
+               java -version 2>&1 | head -1 && \
+               mvn -version 2>&1 | head -1 && \
+               psql --version && \
+               node -v && npm -v && \
+               echo '=== Projets ===' && \
+               ls ~/gmao-backend/ && echo '✅ gmao-backend OK' && \
+               ls ~/gmao-frontend/ && echo '✅ gmao-frontend OK'"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 3 — Démarrage Application (DB + Backend Spring Boot + Frontend Angular)
+#  → Vérifie si les services tournent déjà avant de relancer
+# ════════════════════════════════════════════════════════════════════════════
+  job3_start_app:
+    name: "JOB 3 — Démarrage Application GMAO"
+    runs-on: ubuntu-latest
+    needs: [job1_create_vm, job2_post_install]
+
+    env:
+      VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
+
+    steps:
+      - name: 📥 Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configuration clé SSH (vockey)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
+          chmod 600 ~/.ssh/vockey.pem
+
+      # ── Vérifier si l'app tourne déjà ────────────────────────────────────
+      - name: 🔍 Vérification services existants
+        id: check_app
+        run: |
+          BACKEND_UP=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+            http://${{ env.VM_IP }}:8080 2>/dev/null || echo "000")
+          FRONTEND_UP=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+            http://${{ env.VM_IP }}:4200 2>/dev/null || echo "000")
+
+          echo "Backend HTTP status:  $BACKEND_UP"
+          echo "Frontend HTTP status: $FRONTEND_UP"
+
+          if [ "$BACKEND_UP" != "000" ] && [ "$FRONTEND_UP" != "000" ]; then
+            echo "✅ Backend ET Frontend déjà opérationnels → skip démarrage"
+            echo "app_running=true" >> $GITHUB_OUTPUT
+          else
+            echo "🔄 Démarrage nécessaire (backend=$BACKEND_UP, frontend=$FRONTEND_UP)"
+            echo "app_running=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Démarrage si nécessaire ──────────────────────────────────────────
+      - name: 📤 Copie du script de démarrage
+        if: steps.check_app.outputs.app_running != 'true'
+        run: |
+          scp -i ~/.ssh/vockey.pem \
+              -o StrictHostKeyChecking=no \
+              scripts/03_start_app.sh \
+              ubuntu@${{ env.VM_IP }}:~/03_start_app.sh
+
+      - name: 🚀 Lancement (restore DB + Spring Boot + Angular)
+        if: steps.check_app.outputs.app_running != 'true'
+        timeout-minutes: 10
+        run: |
+          ssh -i ~/.ssh/vockey.pem \
+              -o StrictHostKeyChecking=no \
+              ubuntu@${{ env.VM_IP }} \
+              "chmod +x ~/03_start_app.sh && ~/03_start_app.sh"
+
+      # ── Tests de connectivité (toujours exécutés) ────────────────────────
+      - name: 🔍 Test de connectivité Backend (port 8080)
+        run: |
+          echo "Test http://${{ env.VM_IP }}:8080 ..."
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+              http://${{ env.VM_IP }}:8080 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" != "000" ]; then
+              echo "✅ Backend répond sur le port 8080 (HTTP $HTTP_CODE)"
+              exit 0
+            fi
+            echo "  Tentative $i/12 — 5s..."
+            sleep 5
+          done
+          echo "❌ Backend non accessible après 60s"
+          exit 1
+
+      - name: 🔍 Test de connectivité Frontend Angular (port 4200)
+        run: |
+          echo "Test http://${{ env.VM_IP }}:4200 ..."
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+              http://${{ env.VM_IP }}:4200 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" != "000" ]; then
+              echo "✅ Frontend Angular répond sur le port 4200 (HTTP $HTTP_CODE)"
+              exit 0
+            fi
+            echo "  Tentative $i/12 — 5s..."
+            sleep 5
+          done
+          echo "❌ Frontend Angular non accessible après 60s"
+          exit 1
+
+      # ── Résumé final ─────────────────────────────────────────────────────
+      - name: 📋 Résumé du déploiement
+        if: always()
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "║         DÉPLOIEMENT GMAO TERMINÉ ✅                  ║"
+          echo "╠══════════════════════════════════════════════════════╣"
+          echo "║  Backend  (Spring Boot) → http://${{ env.VM_IP }}:8080  ║"
+          echo "║  Frontend (Angular)     → http://${{ env.VM_IP }}:4200  ║"
+          echo "╚══════════════════════════════════════════════════════╝"
